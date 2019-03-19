@@ -945,6 +945,10 @@ fu_superio_device_init (FuSuperioDevice *self)
 {
 	fu_device_set_physical_id (FU_DEVICE (self), "/dev/port");
 	fu_device_add_flag (FU_DEVICE (self), FWUPD_DEVICE_FLAG_INTERNAL);
+	fu_device_add_flag (FU_DEVICE (self), FWUPD_DEVICE_FLAG_UPDATABLE);
+	fu_device_add_flag (FU_DEVICE (self), FWUPD_DEVICE_FLAG_ONLY_OFFLINE);
+	fu_device_add_flag (FU_DEVICE (self), FWUPD_DEVICE_FLAG_REQUIRE_AC);
+	fu_device_add_flag (FU_DEVICE (self), FWUPD_DEVICE_FLAG_NEEDS_REBOOT);
 	fu_device_set_summary (FU_DEVICE (self), "SuperIO device");
 	fu_device_add_icon (FU_DEVICE (self), "computer");
 }
