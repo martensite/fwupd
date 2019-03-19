@@ -12,6 +12,7 @@
 
 #include <glib/gstdio.h>
 
+#include "fu-chunk.h"
 #include "fu-superio-common.h"
 #include "fu-superio-device.h"
 
@@ -112,8 +113,10 @@ fu_superio_device_ec_read (FuSuperioDevice *self,
 			   guint8 *data,
 			   GError **error)
 {
-	if (!fu_superio_device_wait_for (self, SIO_STATUS_EC_OBF, TRUE, error))
+	if (!fu_superio_device_wait_for (self, SIO_STATUS_EC_OBF, TRUE, error)) {
+		g_prefix_error (error, "ec-read: ");
 		return FALSE;
+	}
 	return fu_superio_inb (self->fd, port, data, error);
 }
 
@@ -123,8 +126,10 @@ fu_superio_device_ec_write (FuSuperioDevice *self,
 			    guint8 data,
 			    GError **error)
 {
-	if (!fu_superio_device_wait_for (self, SIO_STATUS_EC_IBF, FALSE, error))
+	if (!fu_superio_device_wait_for (self, SIO_STATUS_EC_IBF, FALSE, error)) {
+		g_prefix_error (error, "ec-write: ");
 		return FALSE;
+	}
 	return fu_superio_outb (self->fd, port, data, error);
 }
 
@@ -442,6 +447,7 @@ fu_superio_device_attach (FuDevice *device, GError **error)
 		return FALSE;
 
 	/* success */
+	fu_device_remove_flag (self, FWUPD_DEVICE_FLAG_IS_BOOTLOADER);
 	return TRUE;
 }
 
@@ -466,6 +472,7 @@ fu_superio_device_detach (FuDevice *device, GError **error)
 	}
 
 	/* success */
+	fu_device_add_flag (self, FWUPD_DEVICE_FLAG_IS_BOOTLOADER);
 	return TRUE;
 }
 
@@ -476,6 +483,460 @@ fu_superio_device_close (FuDevice *device, GError **error)
 	if (!g_close (self->fd, error))
 		return FALSE;
 	self->fd = 0;
+	return TRUE;
+}
+
+static gboolean
+fu_superio_device_ec_pm1do_sci (FuSuperioDevice *self, guint8 val, GError **error)
+{
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DOSCI, error))
+		return FALSE;
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1, val, error))
+		return FALSE;
+	return TRUE;
+}
+
+static gboolean
+fu_superio_device_ec_pm1do_smi (FuSuperioDevice *self, guint8 val, GError **error)
+{
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DOCMI, error))
+		return FALSE;
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1, val, error))
+		return FALSE;
+	return TRUE;
+}
+
+static gboolean
+fu_superio_device_ec_read_status (FuSuperioDevice *self, GError **error)
+{
+	guint8 tmp = 0x00;
+
+	/* read status register */
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DO, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_sci (self, SIO_SPI_CMD_RDSR, error))
+		return FALSE;
+
+	/* wait for write */
+	do {
+		if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+						 SIO_EC_PMC_PM1DI, error))
+			return FALSE;
+		if (!fu_superio_device_ec_read (self, self->pm1_iobad0,
+						&tmp, error))
+			return FALSE;
+	} while ((tmp & SIO_STATUS_EC_OBF) != 0);
+
+	/* watch SCI events */
+	return fu_superio_device_ec_write (self, self->pm1_iobad1,
+					   SIO_EC_PMC_PM1DISCI, error);
+}
+
+static gboolean
+fu_superio_device_ec_write_disable (FuSuperioDevice *self, GError **error)
+{
+	guint8 tmp = 0x00;
+
+	/* read existing status */
+	if (!fu_superio_device_ec_read_status (self, error))
+		return FALSE;
+
+	/* write disable */
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DO, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_sci (self, SIO_SPI_CMD_WRDI, error))
+		return FALSE;
+
+	/* read status register */
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DO, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_sci (self, SIO_SPI_CMD_RDSR, error))
+		return FALSE;
+
+	/* wait for read */
+	do {
+		if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+						 SIO_EC_PMC_PM1DI, error))
+			return FALSE;
+		if (!fu_superio_device_ec_read (self, self->pm1_iobad0,
+						&tmp, error))
+			return FALSE;
+	} while ((tmp & SIO_STATUS_EC_IBF) != 0);
+
+	/* watch SCI events */
+	return fu_superio_device_ec_write (self, self->pm1_iobad1,
+					   SIO_EC_PMC_PM1DISCI, error);
+}
+
+static gboolean
+fu_superio_device_ec_write_enable (FuSuperioDevice *self, GError **error)
+{
+	guint8 tmp = 0x0;
+
+	/* read existing status */
+	if (!fu_superio_device_ec_read_status (self, error))
+		return FALSE;
+
+	/* write enable */
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DO, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_sci (self, SIO_SPI_CMD_WREN, error))
+		return FALSE;
+
+	/* read status register */
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DO, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_sci (self, SIO_SPI_CMD_RDSR, error))
+		return FALSE;
+
+	/* wait for !BUSY */
+	do {
+		if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+						 SIO_EC_PMC_PM1DI, error))
+			return FALSE;
+		if (!fu_superio_device_ec_read (self, self->pm1_iobad0,
+						&tmp, error))
+			return FALSE;
+	} while ((tmp & 3) != SIO_STATUS_EC_IBF);
+
+	/* watch SCI events */
+	return fu_superio_device_ec_write (self, self->pm1_iobad1,
+					   SIO_EC_PMC_PM1DISCI, error);
+}
+
+static GBytes *
+fu_superio_device_read_addr (FuSuperioDevice *self,
+			     guint32 addr,
+			     guint size,
+			     GFileProgressCallback progress_cb,
+			     GError **error)
+{
+	g_autofree guint8 *buf = NULL;
+
+	/* setup both, just like the vendor programmer... */
+	if (!fu_superio_device_ec_write_disable (self, error))
+		return FALSE;
+	if (!fu_superio_device_ec_read_status (self, error))
+		return FALSE;
+
+	/* high speed read */
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DO, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_sci (self, SIO_SPI_CMD_HS_READ, error))
+		return FALSE;
+
+	/* set address, MSB, MID, LSB, then ZERO */
+	if (!fu_superio_device_ec_pm1do_smi (self, addr << 16, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_smi (self, addr << 8, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_smi (self, addr & 0xff, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_smi (self, 0x0, error))
+		return FALSE;
+
+	/* read out data */
+	buf = g_malloc0 (size);
+	for (guint i = 0; i < size; i++) {
+		if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+						 SIO_EC_PMC_PM1DI, error))
+			return FALSE;
+		if (!fu_superio_device_ec_read (self, self->pm1_iobad0, &buf[i], error))
+			return FALSE;
+
+		/* update progress */
+		if (progress_cb != NULL)
+			progress_cb ((goffset) i, (goffset) size, self);
+	}
+
+	/* reset back? */
+	if (!fu_superio_device_ec_read_status (self, error))
+		return FALSE;
+
+	/* success */
+	return g_bytes_new_take (g_steal_pointer (&buf), size);
+}
+
+static void
+fu_superio_device_progress_cb (goffset current, goffset total, gpointer user_data)
+{
+	FuDevice *device = FU_DEVICE (user_data);
+	fu_device_set_progress_full (device, (gsize) current, (gsize) total);
+}
+
+static gboolean
+fu_superio_device_write_addr (FuSuperioDevice *self, guint addr, GBytes *fw, GError **error)
+{
+	gsize size = 0;
+	const guint8 *buf = g_bytes_get_data (fw, &size);
+
+	/* sanity check */
+	if ((addr & 0xff) != 0x00) {
+		g_set_error (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_NOT_SUPPORTED,
+			     "write addr unaligned, got 0x%04x",
+			     (guint) addr);
+	}
+	if (size % 2 != 0) {
+		g_set_error (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_NOT_SUPPORTED,
+			     "write length not supported, got 0x%04x",
+			     (guint) size);
+	}
+
+	/* enable writes */
+	if (!fu_superio_device_ec_write_enable (self, error))
+		return FALSE;
+
+	/* write DWORDs */
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DO, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_sci (self, SIO_SPI_CMD_WRITE_WORD, error))
+		return FALSE;
+
+	/* set address, MSB, MID, LSB, then ZERO */
+	if (!fu_superio_device_ec_pm1do_smi (self, addr << 16, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_smi (self, addr << 8, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_smi (self, addr & 0xff, error))
+		return FALSE;
+
+	/* write data two bytes at a time */
+	for (guint i = 0; i < size; i += 2) {
+		if (i > 0) {
+			if (!fu_superio_device_ec_read_status (self, error))
+				return FALSE;
+			if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+							 SIO_EC_PMC_PM1DO, error))
+				return FALSE;
+			if (!fu_superio_device_ec_pm1do_sci (self,
+							     SIO_SPI_CMD_WRITE_WORD,
+							     error))
+				return FALSE;
+		}
+		if (!fu_superio_device_ec_pm1do_smi (self, buf[i+0], error))
+			return FALSE;
+		if (!fu_superio_device_ec_pm1do_smi (self, buf[i+1], error))
+			return FALSE;
+	}
+
+	/* reset back? */
+	if (!fu_superio_device_ec_write_disable (self, error))
+		return FALSE;
+	return fu_superio_device_ec_read_status (self, error);
+}
+
+static gboolean
+fu_superio_device_erase_addr (FuSuperioDevice *self, guint addr, GError **error)
+{
+	/* enable writes */
+	if (!fu_superio_device_ec_write_enable (self, error))
+		return FALSE;
+
+	/* sector erase */
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DO, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_sci (self, SIO_SPI_CMD_4K_SECTOR_ERASE, error))
+		return FALSE;
+
+	/* set address, MSB, MID, LSB */
+	if (!fu_superio_device_ec_pm1do_smi (self, addr << 16, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_smi (self, addr << 8, error))
+		return FALSE;
+	if (!fu_superio_device_ec_pm1do_smi (self, addr & 0xff, error))
+		return FALSE;
+
+	/* watch SCI events */
+	if (!fu_superio_device_ec_write (self, self->pm1_iobad1,
+					 SIO_EC_PMC_PM1DISCI, error))
+		return FALSE;
+	return fu_superio_device_ec_read_status (self, error);
+}
+
+static GBytes *
+fu_superio_device_read_firmware (FuDevice *device, GError **error)
+{
+	FuSuperioDevice *self = FU_SUPERIO_DEVICE (device);
+	/* get entire flash contents */
+	fu_device_set_status (device, FWUPD_STATUS_DEVICE_READ);
+	return fu_superio_device_read_addr (self, 0x0, self->size,
+					    fu_superio_device_progress_cb,
+					    error);
+}
+
+static GBytes *
+fu_superio_device_prepare_firmware (FuDevice *device, GBytes *fw, GError **error)
+{
+	FuSuperioDevice *self = FU_SUPERIO_DEVICE (device);
+	gsize sz = 0;
+	const guint8 *buf = g_bytes_get_data (fw, &sz);
+	const guint8 sig1[] = { 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5, 0xa5 };
+	const guint8 sig2[] = { 0x85, 0x12, 0x5a, 0x5a, 0xaa, 0xaa, 0x55, 0x55 };
+
+	/* check size */
+	if (sz != self->size) {
+		g_set_error (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_INVALID_FILE,
+			     "firmware size incorrect, got 0x%04x, expected 0x%04x",
+			     (guint) sz, (guint) self->size);
+		return FALSE;
+	}
+
+	/* find signature -- maybe look for 0xb4 too? */
+	for (gsize off = 0; off < sz; off += 16) {
+		if (memcmp (&buf[off], sig1, sizeof(sig1)) == 0 &&
+		    memcmp (&buf[off + 8], sig2, sizeof(sig2)) == 0) {
+			g_debug ("found signature at 0x%4x", (guint) off);
+			return g_object_ref (fw);
+		}
+	}
+	g_set_error_literal (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_NOT_SUPPORTED,
+			     "did not detect signature in firmware image");
+	return NULL;
+}
+
+static gboolean
+fu_superio_device_check_eflash (FuSuperioDevice *self, GError **error)
+{
+	g_autoptr(GBytes) fw = NULL;
+	const guint sigsz = 16;
+
+	/* last 16 bytes of eeprom */
+	fw = fu_superio_device_read_addr (self, self->size - sigsz,
+					  sigsz, NULL, error);
+	if (fw == NULL) {
+		g_prefix_error (error, "failed to read signature bytes");
+		return FALSE;
+	}
+
+	/* cannot flash here without keyboard programmer */
+	if (!fu_common_bytes_is_empty (fw)) {
+		g_set_error_literal (error,
+				     FWUPD_ERROR,
+				     FWUPD_ERROR_NOT_SUPPORTED,
+				     "eflash has been protected");
+		return FALSE;
+	}
+
+	/* success */
+	return TRUE;
+}
+
+static gboolean
+fu_superio_device_write_chunk (FuSuperioDevice *self, FuChunk *chk, GError **error)
+{
+	g_autoptr(GBytes) fw1 = NULL;
+	g_autoptr(GBytes) fw2 = NULL;
+	g_autoptr(GBytes) fw3 = NULL;
+
+	/* erase page */
+	if (!fu_superio_device_erase_addr (self, chk->address, error)) {
+		g_prefix_error (error, "failed to erase @0x%04x", (guint) chk->address);
+		return FALSE;
+	}
+
+	/* check erased */
+	fw1 = fu_superio_device_read_addr (self, chk->address,
+					   chk->data_sz, NULL,
+					   error);
+	if (fw1 == NULL) {
+		g_prefix_error (error, "failed to read erased "
+				"bytes @0x%04x", (guint) chk->address);
+		return FALSE;
+	}
+	if (!fu_common_bytes_is_empty (fw1)) {
+		g_set_error_literal (error,
+				     FWUPD_ERROR,
+				     FWUPD_ERROR_READ,
+				     "sector was not erased");
+		return FALSE;
+	}
+
+	/* skip empty page */
+	fw2 = g_bytes_new_static (chk->data, chk->data_sz);
+	if (fu_common_bytes_is_empty (fw2))
+		return TRUE;
+
+	/* write page */
+	if (!fu_superio_device_write_addr (self, chk->address, fw2, error)) {
+		g_prefix_error (error, "failed to write @0x%04x", (guint) chk->address);
+		return FALSE;
+	}
+
+	/* verify page */
+	fw3 = fu_superio_device_read_addr (self, chk->address,
+					   chk->data_sz, NULL,
+					   error);
+	if (fw3 == NULL) {
+		g_prefix_error (error, "failed to read written "
+				"bytes @0x%04x", (guint) chk->address);
+		return FALSE;
+	}
+	if (!g_bytes_equal (fw2, fw3)) {
+		g_set_error (error,
+			     FWUPD_ERROR,
+			     FWUPD_ERROR_READ,
+			     "failed to verify @0x%04x",
+			     (guint) chk->address);
+		return FALSE;
+	}
+
+	/* success */
+	return TRUE;
+}
+
+static gboolean
+fu_superio_device_write_firmware (FuDevice *device, GBytes *fw, GError **error)
+{
+	FuSuperioDevice *self = FU_SUPERIO_DEVICE (device);
+	g_autoptr(GPtrArray) chunks = NULL;
+
+	/* check eflash is writable */
+	if (!fu_superio_device_check_eflash (self, error))
+		return FALSE;
+
+	/* chunks of 1kB, skipping the final chunk */
+	chunks = fu_chunk_array_new_from_bytes (fw, 0x00, 0x00, 0x400);
+	fu_device_set_status (device, FWUPD_STATUS_DEVICE_WRITE);
+	for (guint i = 0; i < chunks->len - 1; i++) {
+		FuChunk *chk = g_ptr_array_index (chunks, i);
+
+		/* try this many times; the failure-to-flash case leaves you
+		 * without a keyboard and future boot may completely fail */
+		for (guint j = 0;; j++) {
+			g_autoptr(GError) error_chk = NULL;
+			if (fu_superio_device_write_chunk (self, chk, &error_chk))
+				break;
+			if (j > 5) {
+				g_propagate_error (error, g_steal_pointer (&error_chk));
+				return FALSE;
+			}
+			g_warning ("failure %u: %s", j, error_chk->message);
+		}
+
+		/* set progress */
+		fu_device_set_progress_full (device, (gsize) i, (gsize) chunks->len);
+	}
+
+	/* success */
+	fu_device_set_progress (device, 100);
 	return TRUE;
 }
 
@@ -504,6 +965,9 @@ fu_superio_device_class_init (FuSuperioDeviceClass *klass)
 	klass_device->open = fu_superio_device_open;
 	klass_device->attach = fu_superio_device_attach;
 	klass_device->detach = fu_superio_device_detach;
+	klass_device->read_firmware = fu_superio_device_read_firmware;
+	klass_device->write_firmware = fu_superio_device_write_firmware;
+	klass_device->prepare_firmware = fu_superio_device_prepare_firmware;
 	klass_device->probe = fu_superio_device_probe;
 	klass_device->setup = fu_superio_device_setup;
 	klass_device->close = fu_superio_device_close;
