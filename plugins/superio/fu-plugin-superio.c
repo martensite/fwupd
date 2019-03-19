@@ -107,11 +107,40 @@ fu_plugin_verify_detach (FuPlugin *plugin, FuDevice *device, GError **error)
 	return fu_device_detach (device, error);
 }
 
+/* for reasons unknown, the 14th byte of the 16 byte signature is always read
+ * from the hardware as 0x00 rather than 0x7f -- and 0xaa is specified as
+ * correct! */
+static GBytes *
+fu_plugin_superio_fix_signature (GBytes *fw)
+{
+	gsize sz = 0;
+	const guint8 *buf = g_bytes_get_data (fw, &sz);
+	g_autofree guint8 *buf2 = NULL;
+
+	/* not big enough */
+	if (sz < 0x4d + 1) {
+		g_warning ("image too small to fix");
+		return g_bytes_ref (fw);
+	}
+
+	/* not zero */
+	if (buf2[0x4d] != 0x0) {
+		g_warning ("nonzero signature byte");
+		return g_bytes_ref (fw);
+	}
+
+	/* fix signature to match SMT version */
+	buf2 = g_memdup (buf, sz);
+	buf2[0x4d] = 0x7f;
+	return g_bytes_new_take (g_steal_pointer (&buf2), sz);
+}
+
 gboolean
 fu_plugin_verify (FuPlugin *plugin, FuDevice *device,
 		  FuPluginVerifyFlags flags, GError **error)
 {
-	g_autoptr(GBytes) blob_fw = NULL;
+	g_autoptr(GBytes) fw = NULL;
+	g_autoptr(GBytes) fw_fixed = NULL;
 	g_autoptr(FuDeviceLocker) locker = NULL;
 	GChecksumType checksum_types[] = {
 		G_CHECKSUM_SHA1,
@@ -122,12 +151,13 @@ fu_plugin_verify (FuPlugin *plugin, FuDevice *device,
 	locker = fu_device_locker_new (device, error);
 	if (locker == NULL)
 		return FALSE;
-	blob_fw = fu_device_read_firmware (device, error);
-	if (blob_fw == NULL)
+	fw = fu_device_read_firmware (device, error);
+	if (fw == NULL)
 		return FALSE;
+	fw_fixed = fu_plugin_superio_fix_signature (fw);
 	for (guint i = 0; checksum_types[i] != 0; i++) {
 		g_autofree gchar *hash = NULL;
-		hash = g_compute_checksum_for_bytes (checksum_types[i], blob_fw);
+		hash = g_compute_checksum_for_bytes (checksum_types[i], fw_fixed);
 		fu_device_add_checksum (device, hash);
 	}
 	return TRUE;
