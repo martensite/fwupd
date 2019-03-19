@@ -124,7 +124,7 @@ fu_plugin_superio_fix_signature (GBytes *fw)
 	}
 
 	/* not zero */
-	if (buf2[0x4d] != 0x0) {
+	if (buf[0x4d] != 0x0) {
 		g_warning ("nonzero signature byte");
 		return g_bytes_ref (fw);
 	}
